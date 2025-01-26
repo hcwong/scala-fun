@@ -6,7 +6,9 @@ object Main {
 
   case class Nested(bar: String)
   case class Foo(test: String, maybeNested: Option[Nested], nested: Nested)
-  case class Dog(name: String, age: Int)
+  sealed trait Animal
+  case class Dog(name: String, age: Int) extends Animal
+  case class Penguin(name: String, species: String) extends Animal
 
   // Type Astronaut Guide to Shapeless
   trait CsvEncoder[A] {
@@ -33,11 +35,23 @@ object Main {
     }
 
     implicit def genericEncoder[A, R](implicit
-        gen: Generic[A] { type Repr = R },
+        gen: Generic.Aux[A, R],
         enc: CsvEncoder[R]
         // gen.to(a) converts the generic to a hList.
         // Resolution is done by our hList encoders above
     ): CsvEncoder[A] = instance(a => enc.encode(gen.to(a)))
+
+    implicit val cNilEncoder: CsvEncoder[CNil] =
+      instance(cnil => sys.error("Not possible"))
+
+    implicit def coproductEncoder[H, T <: Coproduct](implicit
+        hEncoder: CsvEncoder[H],
+        tEncoder: CsvEncoder[T]
+    ): CsvEncoder[H :+: T] = instance {
+      // disjunction of types, hence the match statement
+      case Inl(h) => hEncoder.encode(h)
+      case Inr(t) => tEncoder.encode(t)
+    }
   }
 
   // When all params ot implicit def are implicit, compiler can use
@@ -60,19 +74,17 @@ object Main {
   def main(array: Array[String]): Unit = {
     import CsvEncoder._
 
-    implicit val dogGeneric = Generic[Dog]
     implicit val intEncoder: CsvEncoder[Int] =
       instance(num => List(num.toString))
     implicit val strEncoder: CsvEncoder[String] = instance(s => List(s))
-//    implicit val dogEncoder =
-//    CsvEncoder.instance[Dog](dog => List(dog.name, dog.age.toString))
 
     /** writeCsv(dogs)(
       *    genericEncoder(
-      *      Generic[Dog],
+      *      Generic[Dog], // it seems like shapeless implicitly resolves the Generic
       *      hListEncoder(StringEncoder,
       *        hListEncoder(intEncoder, hnilEncoder))))
       */
     println(writeCsv(List[Dog](Dog("Ranmaru", 10))))
+    println(writeCsv(List[Animal](Penguin("steve", "adelie"))))
   }
 }
