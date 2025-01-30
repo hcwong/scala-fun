@@ -190,13 +190,176 @@ object Main {
     }
   }
 
+  object Extractor {
+    trait KeyExtractor[A] {
+      def extract(value: A, fieldNames: Seq[String]): Option[Any]
+    }
+
+    object KeyExtractor {
+      // Summoner method
+      def apply[A](implicit keyExtractor: KeyExtractor[A]) = keyExtractor
+
+      // Constructor method
+      def instance[A](func: (A, Seq[String]) => Option[Any]): KeyExtractor[A] =
+        new KeyExtractor[A] {
+          def extract(value: A, fieldNames: Seq[String]): Option[Any] =
+            func(value, fieldNames)
+        }
+
+      implicit def coProductEncoder[H, T <: Coproduct](implicit
+          headEncoder: Lazy[KeyExtractor[H]],
+          tailEncoder: KeyExtractor[T]
+      ): KeyExtractor[H :+: T] = instance { (value, fieldNames) =>
+        value match {
+          case Inl(head) => headEncoder.value.extract(head, fieldNames)
+          case Inr(tail) => tailEncoder.extract(tail, fieldNames)
+        }
+      }
+
+      implicit def hNilExtractor: KeyExtractor[HNil] = instance {
+        (value: HNil, fieldNames: Seq[String]) => None
+      }
+
+      implicit def instantiateOptionalKeyExtractor[A](implicit
+          keyExtractor: Lazy[KeyExtractor[A]]
+      ): Option[Lazy[KeyExtractor[A]]] =
+        Some(keyExtractor)
+
+      implicit def instantiateOptionalGeneric[A, H](implicit
+          generic: LabelledGeneric.Aux[A, H]
+      ): Option[LabelledGeneric.Aux[A, H]] =
+        Some(generic)
+
+      implicit def hListExtractorForLeafValues[
+          K <: Symbol,
+          H,
+          HRepr <: HList,
+          T <: HList
+      ](implicit
+          witness: Witness.Aux[K],
+          tailExtractor: KeyExtractor[T],
+          ev: Option[H <:< HList] = None,
+          // Maybe we add Option Generic and Option headExtractor here
+          // and then if generic and ev is defined, treat this as a case class, using get field name
+          headExtractor: Option[Lazy[KeyExtractor[HRepr]]] = None,
+          generic: Option[LabelledGeneric.Aux[H, HRepr]] = None
+      ): KeyExtractor[FieldType[K, H] :: T] = {
+        val fieldName = witness.value.name
+        instance { (hList: FieldType[K, H] :: T, fieldNames: Seq[String]) =>
+          {
+            fieldNames match {
+              case Seq(headFieldName)
+                  if headExtractor.isEmpty && generic.isEmpty && headFieldName == fieldName =>
+                Some(hList.head)
+              case Seq(headFieldName, rest @ _*)
+                  if headExtractor.isDefined && generic.isDefined && headFieldName == fieldName =>
+                headExtractor.get.value
+                  .extract(generic.get.to(getFieldValue(hList.head)), rest)
+              case seq if seq.isEmpty =>
+                sys.error("Received empty fieldnames list")
+              case Seq(headFieldName, rest @ _*)
+                  if headFieldName != fieldName =>
+                tailExtractor.extract(hList.tail, fieldNames)
+              case _ =>
+                sys.error(
+                  s"Unrecognised value: ${hList.toString}, ${fieldNames}, ${headExtractor.toString} ${generic.toString}"
+                )
+            }
+          }
+        }
+      }
+
+      // We need this to unpack the value of nested case classes
+      def getFieldValue[K, V](value: FieldType[K, V]): V = value
+
+      /**      implicit def nestedHListExtractor[
+        *        K <: Symbol,
+        *        H,
+        *        HRepr <: HList,
+        *        T <: HList
+        *    ](implicit
+        *        witness: Witness.Aux[K],
+        *        generic: LabelledGeneric.Aux[H, HRepr],
+        *        headExtractor: Lazy[KeyExtractor[HRepr]],
+        *        tailExtractor: KeyExtractor[T]
+        *    ): KeyExtractor[FieldType[K, H] :: T] = {
+        *      val fieldName = witness.value.name
+        *      instance { (hList: FieldType[K, H] :: T, fieldNames: Seq[String]) =>
+        *        {
+        *          fieldNames match {
+        *            case Seq(headFieldName, rest @ _*) if headFieldName == fieldName =>
+        *              headExtractor.value.extract(generic.to(getFieldValue(hList.head)), rest)
+        *            case seq if seq.isEmpty =>
+        *              sys.error("Received empty fieldnames list")
+        *            case _ => tailExtractor.extract(hList.tail, fieldNames)
+        *          }
+        *        }
+        *      }
+        *    }
+        */
+
+      /**      implicit def hListExtractor[K <: Symbol, H, T <: HList](implicit
+        *        witness: Witness.Aux[K],
+        *        headExtractor: Lazy[KeyExtractor[H]],
+        *        tailExtractor: KeyExtractor[T],
+        *        ev: Option[H <:< HList] = None
+        *    ): KeyExtractor[FieldType[K, H] :: T] = {
+        *      val fieldName = witness.value.name
+        *      instance { (hList: FieldType[K, H] :: T, fieldNames: Seq[String]) =>
+        *        {
+        *          fieldNames match {
+        *            case Seq(headFieldName)
+        *                if ev.isEmpty && headFieldName == fieldName =>
+        *              Some(hList.head)
+        *            case Seq(headFieldName)
+        *                if ev.isDefined && headFieldName == fieldName =>
+        *              sys.error("Last field is still nested")
+        *            case Seq(headFieldName, rest @ _*)
+        *                if ev.isDefined && headFieldName == fieldName =>
+        *              headExtractor.value.extract(hList.head, rest)
+        *            case Seq(headFieldName, rest @ _*)
+        *                if ev.isEmpty && headFieldName == fieldName =>
+        *              sys.error(
+        *                "Reached tail field but still have field names to iterate through"
+        *              )
+        *            case seq if seq.isEmpty =>
+        *              sys.error("Received empty fieldnames list")
+        *            case _ => tailExtractor.extract(hList.tail, fieldNames)
+        *          }
+        *        }
+        *      }
+        *    }
+        */
+
+      // Unfortunately, generics only work one layer at a time - this only handles the first level
+      implicit def genericObjectExtractor[A, B](implicit
+          generic: LabelledGeneric.Aux[A, B],
+          extractor: Lazy[KeyExtractor[B]]
+      ): KeyExtractor[A] = instance { (value: A, fieldNames: Seq[String]) =>
+        extractor.value.extract(generic.to(value), fieldNames)
+      }
+    }
+  }
+
   def main(array: Array[String]): Unit = {
     import CsvEncoder._
+    import Extractor._
     import LabelledGenerics.JsonEncoder
 
     implicit val intEncoder: CsvEncoder[Int] =
       instance(num => List(num.toString))
     implicit val strEncoder: CsvEncoder[String] = instance(s => List(s))
+
+    case class Shiba(
+        name: String,
+        age: Int
+    )
+    case class Human(
+        name: String,
+        dog: Shiba
+    )
+    val ranmaru = Shiba("Ranmaru", 10)
+    val owner = Human("Owner", ranmaru)
 
     // import scala.reflect.runtime.universe.reify allows us to debug implicit resolution
 
@@ -209,5 +372,8 @@ object Main {
     println(writeCsv(List[Dog](Dog("Ranmaru", 10))))
     println(writeCsv(List[Animal](Penguin("steve", "adelie"))))
     println(JsonEncoder[Dog].encode(Dog("Ranmaru", 10)))
+    // LabelledGeneric[Human].to(human).tail.head
+    println(KeyExtractor[Human].extract(owner, Seq("name")))
+    // KeyExtractor[Dog].extract(human, Seq("age"))
   }
 }
